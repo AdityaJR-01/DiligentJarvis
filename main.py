@@ -15,29 +15,37 @@ if "messages" not in st.session_state:
 # --- Configuration ---
 # Using 127.0.0.1 is more stable than 'localhost' for local service connections
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "qwen2.5vl:3b" 
+OLLAMA_CHAT_MODEL = "qwen2.5vl:3b"
+# Dedicated embedding model instead of routing embeddings through the chat model:
+# faster per chunk, and its output dimension is actually documented (768),
+# unlike qwen2.5vl's pooled hidden state.
+OLLAMA_EMBED_MODEL = "nomic-embed-text"
+EMBED_DIM = 768
 PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", "your-key")
 PINECONE_INDEX = "jarvis-index"
 
 # --- Pinecone Initialization (Fixed Error 409) ---
-pc = Pinecone(api_key=PINECONE_API_KEY)
+# Cached so this setup/check only runs once per session instead of on every
+# Streamlit rerun (which happens on every chat message and every upload).
+@st.cache_resource
+def init_pinecone_index():
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
 
-# Get current indexes to avoid 'Resource already exists' error
-existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
+    if PINECONE_INDEX not in existing_indexes:
+        st.info(f"Creating index '{PINECONE_INDEX}'... This may take a minute.")
+        pc.create_index(
+            name=PINECONE_INDEX,
+            dimension=EMBED_DIM,  # Matching nomic-embed-text's output size
+            metric='cosine',
+            spec=ServerlessSpec(cloud='aws', region='us-east-1')
+        )
+        while not pc.describe_index(PINECONE_INDEX).status['ready']:
+            time.sleep(1)
 
-if PINECONE_INDEX not in existing_indexes:
-    st.info(f"Creating index '{PINECONE_INDEX}'... This may take a minute.")
-    pc.create_index(
-        name=PINECONE_INDEX,
-        dimension=3584, # Matching Qwen 2.5 VL embedding size
-        metric='cosine',
-        spec=ServerlessSpec(cloud='aws', region='us-east-1')
-    )
-    # Wait until the index is ready for operations
-    while not pc.describe_index(PINECONE_INDEX).status['ready']:
-        time.sleep(1)
+    return pc.Index(PINECONE_INDEX)
 
-index = pc.Index(PINECONE_INDEX)
+index = init_pinecone_index()
 
 # --- Core RAG Functions ---
 
@@ -46,7 +54,7 @@ def get_embedding(text: str) -> List[float]:
     try:
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/embed",
-            json={"model": OLLAMA_MODEL, "input": text},
+            json={"model": OLLAMA_EMBED_MODEL, "input": text},
             timeout=30
         )
         response.raise_for_status()
@@ -70,7 +78,7 @@ def generate_response(query: str, context: str) -> str:
     try:
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            json={"model": OLLAMA_CHAT_MODEL, "prompt": prompt, "stream": False},
             timeout=60
         )
         response.raise_for_status()
@@ -106,7 +114,14 @@ if user_input:
 st.sidebar.title("Knowledge Base")
 uploaded_file = st.sidebar.file_uploader("Upload a document", type=["txt"])
 
-if uploaded_file:
+if "processed_file" not in st.session_state:
+    st.session_state.processed_file = None
+
+# uploaded_file stays truthy across reruns (e.g. every chat message triggers one),
+# so without this check the same file gets re-chunked and re-upserted every time.
+file_signature = f"{uploaded_file.name}-{uploaded_file.size}" if uploaded_file else None
+
+if uploaded_file and file_signature != st.session_state.processed_file:
     text = uploaded_file.read().decode("utf-8")
     # Split text into chunks for better retrieval
     chunks = [text[i:i+500] for i in range(0, len(text), 450)]
@@ -117,13 +132,14 @@ if uploaded_file:
         embedding = get_embedding(chunk)
         if embedding:
             vectors_to_upsert.append((f"doc-{int(time.time())}-{i}", embedding, {"text": chunk}))
-        
+
         # Batch upsert to improve speed
         if len(vectors_to_upsert) >= 50:
             index.upsert(vectors=vectors_to_upsert)
             vectors_to_upsert = []
-            
+
     if vectors_to_upsert:
         index.upsert(vectors=vectors_to_upsert)
-        
+
+    st.session_state.processed_file = file_signature
     st.sidebar.success("Digital Jarvis has updated its memory!")
