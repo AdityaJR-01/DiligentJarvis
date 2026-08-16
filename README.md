@@ -1,6 +1,6 @@
 # Digital Jarvis: RAG-Powered Assistant
  
-This repository contains a Retrieval-Augmented Generation (RAG) chatbot designed for enterprise data assistance. The system integrates a local Large Language Model (LLM) with a cloud-based vector database to provide accurate, context-aware responses.
+This repository was mainly conceived to complete as a part of a one hour challenge, but was left incomplete. It contains a Retrieval-Augmented Generation (RAG) chatbot designed for enterprise data assistance. The system integrates a local Large Language Model (LLM) with a cloud-based vector database to provide accurate, context-aware responses.
  
 ## Technical Specifications
 - **Large Language Model:** Qwen 2.5 VL (via Ollama) — chat generation
